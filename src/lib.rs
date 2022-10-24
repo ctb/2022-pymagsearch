@@ -1,4 +1,7 @@
 use pyo3::prelude::*;
+use pyo3::create_exception;
+use pyo3::exceptions::PyException;
+
 use rayon::prelude::*;
 
 use std::fs::File;
@@ -16,6 +19,14 @@ use log::{error, info};
 use sourmash::signature::{Signature, SigsTrait};
 use sourmash::sketch::minhash::{max_hash_for_scaled, KmerMinHash};
 use sourmash::sketch::Sketch;
+
+create_exception!(pymagsearch, SomeError, pyo3::exceptions::PyException);
+
+impl std::convert::From<SomeError> for PyErr {
+    fn from(err: SomeError) -> PyErr {
+        PyException::new_err(err.to_string())
+    }
+}
 
 fn check_compatible_downsample(
     me: &KmerMinHash,
@@ -237,7 +248,9 @@ impl PartialEq for PrefetchResult {
 
 impl Eq for PrefetchResult {}
 
-fn prefetch(
+// Find overlapping above specified threshold.
+
+fn filter_overlapping(
     query: &KmerMinHash,
     sketchlist: BinaryHeap<PrefetchResult>,
     threshold_hashes: u64,
@@ -349,7 +362,7 @@ fn load_sketches_above_threshold(
 
 /// Run counter-gather with a query against a list of files.
 
-fn countergather<P: AsRef<Path> + std::fmt::Debug>(
+fn countergather<P: AsRef<Path> + std::fmt::Debug + std::fmt::Display + Clone>(
     query_filename: P,
     matchlist_filename: P,
     threshold_bp: usize,
@@ -366,8 +379,10 @@ fn countergather<P: AsRef<Path> + std::fmt::Debug>(
         .build();
     let template = Sketch::MinHash(template_mh);
 
+    let query_label = query_filename.clone();
+
     println!("Loading query");
-    let mut query = {
+    let query = {
         let sigs = Signature::from_path(dbg!(query_filename)).unwrap();
 
         let mut mm = None;
@@ -407,6 +422,20 @@ fn countergather<P: AsRef<Path> + std::fmt::Debug>(
         return Ok(());
     }
 
+    write_prefetch(query_label.to_string(), prefetch_output, &matchlist)?;
+
+    // now, do the gather!
+    consume_query_by_gather(query, matchlist, threshold_hashes, gather_output,
+                            query_label.to_string());
+
+    Ok(())
+}
+
+fn write_prefetch<P: AsRef<Path> + std::fmt::Debug>(
+    query_label: String,
+    prefetch_output: Option<P>,
+    matches: &BinaryHeap<PrefetchResult>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Write to prefetch output
     let prefetch_out: Box<dyn Write> = match prefetch_output {
         Some(path) => Box::new(BufWriter::new(File::create(path).unwrap())),
@@ -414,12 +443,21 @@ fn countergather<P: AsRef<Path> + std::fmt::Debug>(
     };
     let mut writer = BufWriter::new(prefetch_out);
     writeln!(&mut writer, "match,overlap").unwrap();
-    for m in &matchlist {
-        writeln!(&mut writer, "'{}',{}", m.name, m.overlap);
+    for m in matches {
+        writeln!(&mut writer, "'{}','{}',{}", query_label, m.name, m.overlap);
     }
-    // @CTB close?
 
-    // Write to gather output
+    Ok(())
+}
+
+fn consume_query_by_gather<P: AsRef<Path> + std::fmt::Debug>(
+    query: KmerMinHash,
+    sketchlist: BinaryHeap<PrefetchResult>,
+    threshold_hashes: u64,
+    gather_output: Option<P>,
+    query_label: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Set up gather output
     let gather_out: Box<dyn Write> = match gather_output {
         Some(path) => Box::new(BufWriter::new(File::create(path).unwrap())),
         None => Box::new(std::io::stdout()),
@@ -427,23 +465,128 @@ fn countergather<P: AsRef<Path> + std::fmt::Debug>(
     let mut writer = BufWriter::new(gather_out);
     writeln!(&mut writer, "match,overlap").unwrap();
 
-    let mut matching_sketches = matchlist;
+    let mut query = query;
+    let mut sketchlist = sketchlist;
 
     // loop until no more matching sketches -
-    while !matching_sketches.is_empty() {
-        println!("remaining: {} {}", query.size(), matching_sketches.len());
-        let best_element = matching_sketches.peek().unwrap();
+    while !sketchlist.is_empty() {
+        println!("{}: remaining: {} {}", query_label, query.size(), sketchlist.len());
+        let best_element = sketchlist.peek().unwrap();
 
         // remove!
-        println!("removing {}", best_element.name);
+        println!("{}: removing {}", query_label, best_element.name);
         query.remove_from(&best_element.minhash)?;
 
-        writeln!(&mut writer, "'{}',{}", best_element.name, best_element.overlap);
+        writeln!(&mut writer, "'{}','{}',{}", query_label, best_element.name,
+                 best_element.overlap);
 
-        // recalculate remaining overlaps between query and all sketches.
-        matching_sketches = prefetch(&query, matching_sketches, threshold_hashes);
+        sketchlist = filter_overlapping(&query, sketchlist, threshold_hashes);
     }
+    Ok(())
+}
 
+/// Run counter-gather for multiple queries against a list of files.
+
+fn countergather2<P: AsRef<Path> + std::fmt::Debug + Clone>(
+    query_filenames: P,
+    matchlist_filename: P,
+    threshold_bp: usize,
+    ksize: u8,
+    scaled: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let max_hash = max_hash_for_scaled(scaled as u64);
+    let template_mh = KmerMinHash::builder()
+        .num(0u32)
+        .ksize(ksize as u32)
+        .max_hash(max_hash)
+        .build();
+    let template = Sketch::MinHash(template_mh);
+
+    // load the list of query paths
+    let querylist_paths = load_sketchlist_filenames(query_filenames)?;
+    println!("Loaded {} sig paths in querylist", querylist_paths.len());
+
+    // build the list of paths to match against.
+    println!("Loading matchlist");
+    let matchlist_paths = load_sketchlist_filenames(matchlist_filename)?;
+    println!("Loaded {} sig paths in matchlist", matchlist_paths.len());
+
+    let threshold_hashes : u64 = {
+        let x = threshold_bp / scaled;
+        if x > 0 {
+            x
+        } else {
+            1
+        }
+    }.try_into().unwrap();
+
+    println!("threshold overlap: {} {}", threshold_hashes, threshold_bp);
+
+    // Load all the against sketches
+    let sketchlist = load_sketches(matchlist_paths, &template).unwrap();
+
+    // Iterate over all queries => do prefetch and gather!
+    let processed_queries = AtomicUsize::new(0);
+
+    querylist_paths
+        .par_iter()
+        .for_each(|q| {
+            let i = processed_queries.fetch_add(1, atomic::Ordering::SeqCst);
+            let query_label = q.clone().into_os_string().into_string().unwrap();
+
+            if let Some(query) = {
+                // load query from q
+                let mut mm = None;
+                if let Ok(sigs) = Signature::from_path(dbg!(q)) {
+                    for sig in &sigs {
+                        if let Some(mh) = prepare_query(sig, &template) {
+                            mm = Some(mh);
+                            break;
+                        }
+                    }
+                }
+                mm
+            } {
+                // filter first set of matches out of sketchlist
+                    let matchlist: BinaryHeap<PrefetchResult> = sketchlist
+                    .par_iter()
+                    .filter_map(|sm| {
+                        let mut mm = None;
+
+                        if let Ok(overlap) = sm.minhash.count_common(&query, false) {
+                            if overlap >= threshold_hashes {
+                                let result = PrefetchResult {
+                                    name: sm.name.clone(),
+                                    minhash: sm.minhash.clone(),
+                                    overlap,
+                                };
+                                mm = Some(result);
+                            }
+                        }
+                        mm
+                    })
+                    .collect();
+
+                if matchlist.len() > 0 {
+                    let prefetch_output = format!("prefetch-{i}.csv");
+                    let gather_output = format!("gather-{i}.csv");
+
+                    // save initial list of matches to prefetch output
+                    write_prefetch(query_label.clone(), Some(prefetch_output),
+                                   &matchlist);
+
+                    // now, do the gather!
+                    consume_query_by_gather(query, matchlist, threshold_hashes,
+                                            Some(gather_output), query_label);
+                } else {
+                    println!("No matches to '{}'", query_label);
+                }
+            } else {
+                println!("ERROR loading signature from '{}'", query_label);
+            }
+        });
+
+        
     Ok(())
 }
 
@@ -469,14 +612,34 @@ fn do_countergather(query_filename: String,
                     output_path_prefetch: String,
                     output_path_gather: String,
 ) -> PyResult<()> {
-    countergather(query_filename, siglist_path, threshold_bp, ksize, scaled,
+    let x = countergather(query_filename, siglist_path, threshold_bp, ksize, scaled,
                   Some(output_path_prefetch), Some(output_path_gather));
-    Ok(())
+    match x {
+        Ok(_) => Ok(()),
+        Err(error) => Err(SomeError::new_err("fiz")),
+    }
+}
+
+#[pyfunction]
+fn do_countergather2(query_filenames: String,
+                    siglist_path: String,
+                    threshold_bp: usize,
+                    ksize: u8,
+                    scaled: usize,
+) -> PyResult<()> {
+    let x = countergather2(query_filenames, siglist_path, threshold_bp,
+                           ksize, scaled);
+    match x {
+        Ok(_) => Ok(()),
+        Err(error) => Err(SomeError::new_err("fiz")),
+    }
 }
 
 #[pymodule]
-fn pymagsearch(_py: Python, m: &PyModule) -> PyResult<()> {
+fn pymagsearch(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(do_search, m)?)?;
     m.add_function(wrap_pyfunction!(do_countergather, m)?)?;
+    m.add_function(wrap_pyfunction!(do_countergather2, m)?)?;
+    m.add("SomeError", py.get_type::<SomeError>())?;
     Ok(())
 }
